@@ -1,0 +1,366 @@
+#include <windows.h>
+
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+
+
+
+
+
+
+
+
+typedef struct Win32Timer {
+	int64_t perf_freq;
+	int64_t last_counter;
+} Win32Timer;
+
+typedef struct Backbuffer {
+	int width;
+	int height;
+	int pitch;			// bytes per row
+	void* memory;		// BGRA pixels
+	BITMAPINFO bmi;		// header for StretchDIBits
+} Backbuffer;
+
+
+
+
+
+
+
+static bool g_running;
+static Backbuffer g_backbuffer;
+
+
+
+
+
+
+
+// Backbuffer
+static void backbuffer_free(Backbuffer* b) {
+	if (b->memory) {
+		VirtualFree(b->memory, 0, MEM_RELEASE);
+		b->memory = 0;
+	}
+
+	b->width = 0;
+	b->height = 0;
+	b->pitch = 0;
+}
+
+static void backbuffer_resize(Backbuffer* b, int new_w, int new_h) {
+	if (new_w <= 0 || new_h <= 0) {
+		backbuffer_free(b);
+		return;
+	}
+
+	if (b->memory && b->width == new_w && b->height == new_h) {
+		return;
+	}
+
+	backbuffer_free(b);
+
+	b->width = new_w;
+	b->height = new_h;
+
+	int bytes_per_pixel = 4;
+	b->pitch = b->width * bytes_per_pixel;
+
+	size_t total_bytes = (size_t)b->pitch * (size_t)b->height;
+
+	b->memory = VirtualAlloc(0, total_bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+
+	b->bmi.bmiHeader.biSize = sizeof(b->bmi.bmiHeader);
+	b->bmi.bmiHeader.biWidth = b->width;
+	b->bmi.bmiHeader.biHeight = -b->height;
+	b->bmi.bmiHeader.biPlanes = 1;
+	b->bmi.bmiHeader.biBitCount = 32;
+	b->bmi.bmiHeader.biCompression = BI_RGB;
+	b->bmi.bmiHeader.biSizeImage = 0;
+}
+static void backbuffer_clear(Backbuffer* b, uint32_t color_bgra) {
+	if (!b->memory) {
+		return;
+	}
+
+	// each pixel is 4 bytes bgra in memory when using bi_rgb 32-bit
+	uint8_t* row = (uint8_t*)b->memory;
+
+	for (int y = 0; y < b->height; y += 1) {
+		uint32_t* pixel = (uint32_t*)row;
+		for (int x = 0; x < b->width; x += 1) {
+			pixel[x] = color_bgra;
+		}
+
+		row += b->pitch;
+	}
+}
+
+static void backbuffer_present(HDC dc, const Backbuffer* b, int dest_w, int dest_h) {
+	if (!b->memory) {
+		return;
+	}
+
+	StretchDIBits(
+		dc,
+		0, 0, dest_w, dest_h,     // DEST = actual client size
+		0, 0, b->width, b->height,// SRC = backbuffer size
+		b->memory,
+		&b->bmi,
+		DIB_RGB_COLORS,
+		SRCCOPY
+	);
+}
+
+
+
+
+
+
+
+
+
+
+// Timing
+static void timer_init(Win32Timer* t) {
+	LARGE_INTEGER freq;
+	QueryPerformanceFrequency(&freq);
+	t->perf_freq = (int64_t)freq.QuadPart;
+
+	LARGE_INTEGER counter;
+	QueryPerformanceCounter(&counter);
+	t->last_counter = (int64_t)counter.QuadPart;
+}
+
+static float timer_tick_seconds(Win32Timer* t) {
+	LARGE_INTEGER counter;
+	QueryPerformanceCounter(&counter);
+
+	int64_t now = (int64_t)counter.QuadPart;
+	int64_t delta = now - t->last_counter;
+	t->last_counter = now;
+
+	double seconds = 0.0;
+	if (t->perf_freq > 0) {
+		seconds = (double)delta / (double)t->perf_freq;
+	}
+
+	if (seconds < 0.0) {
+		seconds = 0.0;
+	}
+
+	if (seconds > 0.05) {
+		seconds = 0.05;
+	}
+
+	return (float)seconds;
+}
+
+
+
+
+
+
+
+
+static bool pump_messages(void) {
+	MSG msg;
+	while (PeekMessageA(&msg, 0, 0, 0, PM_REMOVE)) {
+		if (msg.message == WM_QUIT) {
+			return false;
+		}
+		TranslateMessage(&msg);
+		DispatchMessageA(&msg);
+	}
+	return true;
+}
+
+static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+	switch (msg) {
+		case WM_CLOSE: {
+			g_running = false;
+			return 0;
+		}
+
+		case WM_DESTROY: {
+			g_running = false;
+			PostQuitMessage(0);
+			return 0;
+		}
+
+		default: {
+			return DefWindowProcA(hwnd, msg, wParam, lParam);
+		} break;
+	}
+}
+
+
+
+// Rectangle 
+static int int_min(int a, int b) {
+	if (a < b) {
+		return a;
+	}
+	return b;
+}
+
+static int int_max(int a, int b) {
+	if (a > b) {
+		return a;
+	}
+	return b;
+}
+
+static int clamp_int(int v, int lo, int hi) {
+	if (v < lo) {
+		return lo;
+	}
+	if (v > hi) {
+		return hi;
+	}
+	return v;
+}
+
+static void draw_rect(Backbuffer* b, int x0, int y0, int x1, int y1, uint32_t color_bgra) {
+	if (!b->memory) {
+		return;
+	}
+
+	// Normalize so x0 <= x1, y0 <= y1
+	int min_x = int_min(x0, x1);
+	int max_x = int_max(x0, x1);
+	int min_y = int_min(y0, y1);
+	int max_y = int_max(y0, y1);
+
+	// Clip to backbuffer bounds
+	min_x = clamp_int(min_x, 0, b->width);
+	max_x = clamp_int(max_x, 0, b->width);
+	min_y = clamp_int(min_y, 0, b->height);
+	max_y = clamp_int(max_y, 0, b->height);
+
+	// Fully clipped away?
+	if (min_x >= max_x || min_y >= max_y) {
+		return;
+	}
+
+	// Draw rows
+	uint8_t* base = (uint8_t*)b->memory;
+	for (int y = min_y; y < max_y; y += 1) {
+		uint32_t* pixel = (uint32_t*)(base + (size_t)y * (size_t)b->pitch);
+		for (int x = min_x; x < max_x; x += 1) {
+			pixel[x] = color_bgra;
+		}
+	}
+}
+
+
+
+// Frame Work
+static void do_frame_work(HWND hwnd, float dt_seconds) {
+	// Always sync buffer to real client size (fixes black strips).
+	RECT rc;
+	GetClientRect(hwnd, &rc);
+
+	int client_w = rc.right - rc.left;
+	int client_h = rc.bottom - rc.top;
+
+	backbuffer_resize(&g_backbuffer, client_w, client_h);
+
+	(void)dt_seconds;
+
+	uint32_t clear_color = 0xFF202040;
+	backbuffer_clear(&g_backbuffer, clear_color);
+
+	// draw_rect tests
+	draw_rect(&g_backbuffer, 50, 50, 250, 180, 0xFF00FF00);
+	draw_rect(&g_backbuffer, -40, -40, 120, 90, 0xFFFF0000);
+	draw_rect(&g_backbuffer,
+			  g_backbuffer.width - 120, g_backbuffer.height - 80,
+			  g_backbuffer.width + 60, g_backbuffer.height + 40,
+			  0xFF00FFFF);
+
+	HDC dc = GetDC(hwnd);
+	backbuffer_present(dc, &g_backbuffer, client_w, client_h);
+	ReleaseDC(hwnd, dc);
+
+	// title update (optional)
+	static float title_timer = 0.0f;
+	title_timer += dt_seconds;
+
+	if (title_timer >= 0.25f) {
+		title_timer = 0.0f;
+
+		float fps = 0.0f;
+		if (dt_seconds > 0.0f) {
+			fps = 1.0f / dt_seconds;
+		}
+
+		char buffer[256];
+		snprintf(buffer, sizeof(buffer), "Snake - dt: %.4f  fps: %.1f", dt_seconds, fps);
+		SetWindowTextA(hwnd, buffer);
+	}
+}
+
+
+
+
+
+
+
+
+
+
+int WINAPI WinMain(HINSTANCE instance, HINSTANCE prev_instance, LPSTR cmd_line, int show_code) {
+	(void)prev_instance;
+	(void)cmd_line;
+	(void)show_code;
+
+	WNDCLASSA wc = { 0 };
+	wc.style = CS_OWNDC | CS_HREDRAW | CS_VREDRAW;
+	wc.lpfnWndProc = wnd_proc;
+	wc.hInstance = instance;
+	wc.lpszClassName = "MySnakeGameWin32MemAlloc";
+	
+	RegisterClassA(&wc);
+
+	HWND hwnd = CreateWindowExA(
+		0, 
+		wc.lpszClassName,
+		"My Snake Game Win32 Mem Alloc",
+		WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+		CW_USEDEFAULT, CW_USEDEFAULT,
+		900, 700,
+		0, 0, instance, 0
+	);
+
+	RECT rc;
+	GetClientRect(hwnd, &rc);
+	int client_w = rc.right - rc.left;
+	int client_h = rc.bottom - rc.top;
+	backbuffer_resize(&g_backbuffer, client_w, client_h);
+
+	Win32Timer timer;
+	timer_init(&timer);
+
+	g_running = true;
+	while (g_running) {
+		if (!pump_messages()) {
+			g_running = false;
+			break;
+		}
+
+		float dt_seconds = timer_tick_seconds(&timer);
+
+		do_frame_work(hwnd, dt_seconds);
+
+		Sleep(1);
+	}
+
+	backbuffer_free(&g_backbuffer);
+
+	return 0;
+}
+
