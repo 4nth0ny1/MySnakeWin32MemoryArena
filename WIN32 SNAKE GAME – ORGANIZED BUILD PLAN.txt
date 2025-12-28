@@ -1,0 +1,225 @@
+WIN32 SNAKE GAME – ORGANIZED BUILD PLAN
+================================
+
+This document explains how to build the final Win32 Snake game step by step
+in a logical, organized way. Each stage produces a runnable program.
+You never jump ahead.
+
+--------------------------------------------------
+TARGET ARCHITECTURE
+--------------------------------------------------
+
+1. Win32 Shell
+- WinMain
+- Window class registration
+- Message pump (PeekMessage)
+- WndProc for close, resize, input
+- High-resolution timing
+
+2. Software Renderer
+- DIB backbuffer allocated with VirtualAlloc
+- Clear + draw_rect primitives
+- Present using StretchDIBits
+- Backbuffer always matches client size
+
+3. Memory System
+- Permanent arena for long-lived data
+- Per-frame arena that resets every frame
+
+4. Game (Snake)
+- Grid-based logic independent of pixels
+- Fixed-step movement
+- Food, growth, collisions
+- Centered board layout
+
+--------------------------------------------------
+COMPLETED - CHECKPOINT 1 – BLANK WINDOW
+--------------------------------------------------
+
+Goal:
+Create a window that opens and closes cleanly.
+
+You implement:
+- WinMain
+- RegisterClass / CreateWindowEx
+- WndProc handling WM_CLOSE and WM_DESTROY
+- Global running flag
+
+Success:
+A window appears and closes when clicking X.
+
+--------------------------------------------------
+COMPLETE - CHECKPOINT 2 – STABLE MAIN LOOP
+--------------------------------------------------
+
+Goal:
+Run your own loop without blocking.
+
+You implement:
+- while (running)
+- PeekMessage / DispatchMessage
+- Optional Sleep(1)
+
+Success:
+Window stays responsive even when idle.
+
+--------------------------------------------------
+COMPLETE - CHECKPOINT 3 – TIMING (DT)
+--------------------------------------------------
+
+Goal:
+Compute delta time using QueryPerformanceCounter.
+
+You implement:
+- QueryPerformanceFrequency once
+- last_counter storage
+- dt calculation
+- Clamp dt to avoid large jumps
+
+Success:
+dt ~0.016 seconds normally.
+
+--------------------------------------------------
+COMPLETE - CHECKPOINT 4 – BACKBUFFER ALLOCATION
+--------------------------------------------------
+
+Goal:
+Draw pixels in memory and present them.
+
+You implement:
+- Backbuffer struct (width, height, pitch, memory)
+- VirtualAlloc memory
+- BITMAPINFO setup
+- Clear function
+- Present function (StretchDIBits)
+
+Success:
+Window clears to a solid color.
+
+--------------------------------------------------
+COMPLETE - CHECKPOINT 5 – RESIZE HANDLING
+--------------------------------------------------
+
+Goal:
+Correct resizing without distortion.
+
+You implement:
+- WM_SIZE handler
+- GetClientRect
+- Reallocate backbuffer
+
+Success:
+Resize always fills the window correctly.
+
+--------------------------------------------------
+COMPLETE - CHECKPOINT 6 – DRAW_RECT PRIMITIVE
+--------------------------------------------------
+
+Goal:
+Draw rectangles safely.
+
+You implement:
+- clamp helpers
+- draw_rect(x0, y0, x1, y1)
+
+Success:
+Rectangles render without crashing when partially off-screen.
+
+--------------------------------------------------
+COMPLETE - CHECKPOINT 7 – GRID MAPPING
+--------------------------------------------------
+
+Goal:
+Map grid cells to pixels.
+
+You implement:
+- CELL_SIZE
+- Grid width / height
+- Board pixel size
+- Centering offsets
+
+Success:
+A grid of rectangles is centered in the window.
+
+--------------------------------------------------
+COMPLETE - CHECKPOINT 8 – SNAKE DATA MODEL
+--------------------------------------------------
+
+Goal:
+Represent snake and food (no movement yet).
+
+You implement:
+- IVec2 struct
+- SnakeGame struct
+- Segment array
+- Food cell
+
+Success:
+Snake and food render correctly.
+
+--------------------------------------------------
+COMPLETE - CHECKPOINT 9 – INPUT + MOVEMENT
+--------------------------------------------------
+
+Goal:
+Step movement via keyboard.
+
+You implement:
+- Arrow key input
+- Direction changes
+- Opposite-direction blocking
+- Single-step movement
+
+Success:
+Snake moves one cell per key press.
+
+--------------------------------------------------
+COMPLETE - CHECKPOINT 10 – FULL GAME RULES
+--------------------------------------------------
+
+Goal:
+Finish the game.
+
+You implement:
+- Fixed-step movement timer
+- Wall collision
+- Self collision (tail exception)
+- Growth after eating
+- RNG food placement
+- Restart key
+
+Success:
+Fully playable Snake game.
+
+--------------------------------------------------
+COMPLETE - CHECKPOINT 11 - MEMORY ARENA INTEGRATION
+--------------------------------------------------
+
+Phase A – Permanent Arena
+- Allocate snake segments from arena
+- No per-allocation frees
+
+Phase B – Frame Arena
+- Reset each frame
+- Use for transient allocations
+
+--------------------------------------------------
+FILE ORGANIZATION ORDER
+--------------------------------------------------
+
+1. Helpers
+2. Memory Arena
+3. Renderer
+4. Game Logic
+5. Win32 App State
+6. WndProc
+7. WinMain
+
+--------------------------------------------------
+CORE PRINCIPLES
+--------------------------------------------------
+
+- One runnable step at a time
+- No premature optimization
+- Grid logic independent of rendering
+- Allocation strategy added AFTER correctness

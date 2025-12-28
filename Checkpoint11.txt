@@ -1,0 +1,863 @@
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+
+// ------------------------------------------------------------
+// Types / Constants
+// ------------------------------------------------------------
+
+typedef struct Win32Timer {
+    int64_t perf_freq;
+    int64_t last_counter;
+} Win32Timer;
+
+typedef struct Backbuffer {
+    int width;
+    int height;
+    int pitch;       // bytes per row
+    void* memory;    // BGRA pixels
+    BITMAPINFO bmi;  // header for StretchDIBits
+} Backbuffer;
+
+enum {
+    GRID_W = 30,
+    GRID_H = 20,
+    CELL_SIZE = 24
+};
+
+typedef struct BoardLayout {
+    int board_px_w;
+    int board_px_h;
+    int origin_x;
+    int origin_y;
+} BoardLayout;
+
+typedef struct IVec2 {
+    int x;
+    int y;
+} IVec2;
+
+typedef struct InputState {
+    bool up_pressed;
+    bool down_pressed;
+    bool left_pressed;
+    bool right_pressed;
+    bool restart_pressed;
+} InputState;
+
+// ------------------------------------------------------------
+// Memory Arena (header stored inside block)
+// ------------------------------------------------------------
+
+typedef struct MemoryArena {
+    size_t total_size_bytes; // includes header
+    size_t used_size_bytes;  // includes header
+} MemoryArena;
+
+static MemoryArena* arena_create(size_t total_size_bytes) {
+    void* mem = VirtualAlloc(0, total_size_bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    if (!mem) {
+        return 0;
+    }
+
+    MemoryArena* arena = (MemoryArena*)mem;
+    arena->total_size_bytes = total_size_bytes;
+    arena->used_size_bytes = sizeof(MemoryArena);
+    return arena;
+}
+
+static void arena_destroy(MemoryArena* arena) {
+    if (arena) {
+        VirtualFree(arena, 0, MEM_RELEASE);
+    }
+}
+
+static void arena_reset(MemoryArena* arena) {
+    if (!arena) {
+        return;
+    }
+    arena->used_size_bytes = sizeof(MemoryArena);
+}
+
+static size_t arena_remaining_bytes(const MemoryArena* arena) {
+    if (!arena) {
+        return 0;
+    }
+    if (arena->used_size_bytes >= arena->total_size_bytes) {
+        return 0;
+    }
+    return arena->total_size_bytes - arena->used_size_bytes;
+}
+
+static void* arena_alloc(MemoryArena* arena, size_t size_bytes, size_t alignment) {
+    if (!arena) {
+        return 0;
+    }
+    if (alignment == 0) {
+        alignment = 8;
+    }
+
+    size_t current = arena->used_size_bytes;
+
+    size_t mask = alignment - 1;
+    size_t aligned = (current + mask) & ~mask;
+
+    size_t next = aligned + size_bytes;
+    if (next > arena->total_size_bytes) {
+        return 0;
+    }
+
+    arena->used_size_bytes = next;
+    return (void*)((uint8_t*)arena + aligned);
+}
+
+#define ARENA_PUSH_STRUCT(arena, Type) (Type*)arena_alloc((arena), sizeof(Type), _Alignof(Type))
+#define ARENA_PUSH_ARRAY(arena, Type, Count) (Type*)arena_alloc((arena), sizeof(Type) * (size_t)(Count), _Alignof(Type))
+
+// ------------------------------------------------------------
+// App / Game State
+// ------------------------------------------------------------
+
+typedef struct AppState {
+    MemoryArena* permanent;
+    MemoryArena* frame;
+} AppState;
+
+enum {
+    SNAKE_MAX_SEGMENTS = GRID_W * GRID_H
+};
+
+typedef struct SnakeGame {
+    IVec2* segments;
+    int segment_count;
+    int segment_capacity;
+
+    IVec2 food;
+
+    int dir_x;
+    int dir_y;
+
+    bool alive;
+    bool grow_next_step;
+
+    float move_timer;
+    float move_period;
+
+    uint32_t rng_state;
+} SnakeGame;
+
+static AppState g_app;
+static SnakeGame g_game;
+
+static bool g_running;
+static Backbuffer g_backbuffer;
+static BoardLayout g_layout;
+
+static bool g_prev_r_down;
+
+// ------------------------------------------------------------
+// Forward declarations (keep file order flexible)
+// ------------------------------------------------------------
+
+static void backbuffer_resize(Backbuffer* b, int new_w, int new_h);
+static void backbuffer_free(Backbuffer* b);
+static void backbuffer_clear(Backbuffer* b, uint32_t color_bgra);
+static void backbuffer_present(HDC dc, const Backbuffer* b, int dest_w, int dest_h);
+
+static void timer_init(Win32Timer* t);
+static float timer_tick_seconds(Win32Timer* t);
+
+static void board_layout_compute(BoardLayout* out, int client_w, int client_h);
+static void cell_to_pixel_rect(const BoardLayout* l, int cell_x, int cell_y,
+                               int* out_x0, int* out_y0, int* out_x1, int* out_y1);
+
+static void draw_rect(Backbuffer* b, int x0, int y0, int x1, int y1, uint32_t color_bgra);
+static void draw_cell_filled(const BoardLayout* l, int cell_x, int cell_y, uint32_t color_bgra);
+
+static InputState input_read(void);
+static bool key_just_pressed(bool is_down_now, bool* was_down_before);
+
+static void game_apply_direction(SnakeGame* g, const InputState* in);
+static void game_step(SnakeGame* g);
+
+static void game_reset(SnakeGame* g, MemoryArena* permanent);
+static void game_place_food(SnakeGame* g);
+
+// ------------------------------------------------------------
+// Backbuffer
+// ------------------------------------------------------------
+
+static void backbuffer_free(Backbuffer* b) {
+    if (b->memory) {
+        VirtualFree(b->memory, 0, MEM_RELEASE);
+        b->memory = 0;
+    }
+
+    b->width = 0;
+    b->height = 0;
+    b->pitch = 0;
+}
+
+static void backbuffer_resize(Backbuffer* b, int new_w, int new_h) {
+    if (new_w <= 0 || new_h <= 0) {
+        backbuffer_free(b);
+        return;
+    }
+
+    if (b->memory && b->width == new_w && b->height == new_h) {
+        return;
+    }
+
+    backbuffer_free(b);
+
+    b->width = new_w;
+    b->height = new_h;
+
+    int bytes_per_pixel = 4;
+    b->pitch = b->width * bytes_per_pixel;
+
+    size_t total_bytes = (size_t)b->pitch * (size_t)b->height;
+
+    b->memory = VirtualAlloc(0, total_bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+
+    b->bmi.bmiHeader.biSize = sizeof(b->bmi.bmiHeader);
+    b->bmi.bmiHeader.biWidth = b->width;
+    b->bmi.bmiHeader.biHeight = -b->height; // top-down
+    b->bmi.bmiHeader.biPlanes = 1;
+    b->bmi.bmiHeader.biBitCount = 32;
+    b->bmi.bmiHeader.biCompression = BI_RGB;
+    b->bmi.bmiHeader.biSizeImage = 0;
+}
+
+static void backbuffer_clear(Backbuffer* b, uint32_t color_bgra) {
+    if (!b->memory) {
+        return;
+    }
+
+    uint8_t* row = (uint8_t*)b->memory;
+    for (int y = 0; y < b->height; y += 1) {
+        uint32_t* pixel = (uint32_t*)row;
+        for (int x = 0; x < b->width; x += 1) {
+            pixel[x] = color_bgra;
+        }
+        row += b->pitch;
+    }
+}
+
+static void backbuffer_present(HDC dc, const Backbuffer* b, int dest_w, int dest_h) {
+    if (!b->memory) {
+        return;
+    }
+
+    StretchDIBits(
+        dc,
+        0, 0, dest_w, dest_h,
+        0, 0, b->width, b->height,
+        b->memory,
+        &b->bmi,
+        DIB_RGB_COLORS,
+        SRCCOPY
+    );
+}
+
+// ------------------------------------------------------------
+// Timing
+// ------------------------------------------------------------
+
+static void timer_init(Win32Timer* t) {
+    LARGE_INTEGER freq;
+    QueryPerformanceFrequency(&freq);
+    t->perf_freq = (int64_t)freq.QuadPart;
+
+    LARGE_INTEGER counter;
+    QueryPerformanceCounter(&counter);
+    t->last_counter = (int64_t)counter.QuadPart;
+}
+
+static float timer_tick_seconds(Win32Timer* t) {
+    LARGE_INTEGER counter;
+    QueryPerformanceCounter(&counter);
+
+    int64_t now = (int64_t)counter.QuadPart;
+    int64_t delta = now - t->last_counter;
+    t->last_counter = now;
+
+    double seconds = 0.0;
+    if (t->perf_freq > 0) {
+        seconds = (double)delta / (double)t->perf_freq;
+    }
+
+    if (seconds < 0.0) {
+        seconds = 0.0;
+    }
+    if (seconds > 0.05) {
+        seconds = 0.05;
+    }
+
+    return (float)seconds;
+}
+
+// ------------------------------------------------------------
+// Win32 message pump / window proc
+// ------------------------------------------------------------
+
+static bool pump_messages(void) {
+    MSG msg;
+    while (PeekMessageA(&msg, 0, 0, 0, PM_REMOVE)) {
+        if (msg.message == WM_QUIT) {
+            return false;
+        }
+        TranslateMessage(&msg);
+        DispatchMessageA(&msg);
+    }
+    return true;
+}
+
+static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    (void)hwnd;
+    (void)lParam;
+
+    switch (msg) {
+        case WM_CLOSE: {
+            g_running = false;
+            return 0;
+        }
+
+        case WM_DESTROY: {
+            g_running = false;
+            PostQuitMessage(0);
+            return 0;
+        }
+
+        case WM_KEYDOWN: {
+            if (wParam == VK_ESCAPE) {
+                g_running = false;
+                return 0;
+            }
+            return 0;
+        }
+    }
+
+    return DefWindowProcA(hwnd, msg, wParam, lParam);
+}
+
+// ------------------------------------------------------------
+// Grid / drawing helpers
+// ------------------------------------------------------------
+
+static int int_min(int a, int b) {
+    if (a < b) return a;
+    return b;
+}
+
+static int int_max(int a, int b) {
+    if (a > b) return a;
+    return b;
+}
+
+static int clamp_int(int v, int lo, int hi) {
+    if (v < lo) return lo;
+    if (v > hi) return hi;
+    return v;
+}
+
+static void board_layout_compute(BoardLayout* out, int client_w, int client_h) {
+    int board_w = GRID_W * CELL_SIZE;
+    int board_h = GRID_H * CELL_SIZE;
+
+    int ox = (client_w - board_w) / 2;
+    int oy = (client_h - board_h) / 2;
+
+    if (ox < 0) ox = 0;
+    if (oy < 0) oy = 0;
+
+    out->board_px_w = board_w;
+    out->board_px_h = board_h;
+    out->origin_x = ox;
+    out->origin_y = oy;
+}
+
+static void cell_to_pixel_rect(const BoardLayout* l, int cell_x, int cell_y,
+                               int* out_x0, int* out_y0, int* out_x1, int* out_y1) {
+    int x0 = l->origin_x + cell_x * CELL_SIZE;
+    int y0 = l->origin_y + cell_y * CELL_SIZE;
+
+    int x1 = x0 + CELL_SIZE;
+    int y1 = y0 + CELL_SIZE;
+
+    *out_x0 = x0;
+    *out_y0 = y0;
+    *out_x1 = x1;
+    *out_y1 = y1;
+}
+
+static void draw_rect(Backbuffer* b, int x0, int y0, int x1, int y1, uint32_t color_bgra) {
+    if (!b->memory) {
+        return;
+    }
+
+    int min_x = int_min(x0, x1);
+    int max_x = int_max(x0, x1);
+    int min_y = int_min(y0, y1);
+    int max_y = int_max(y0, y1);
+
+    min_x = clamp_int(min_x, 0, b->width);
+    max_x = clamp_int(max_x, 0, b->width);
+    min_y = clamp_int(min_y, 0, b->height);
+    max_y = clamp_int(max_y, 0, b->height);
+
+    if (min_x >= max_x || min_y >= max_y) {
+        return;
+    }
+
+    uint8_t* base = (uint8_t*)b->memory;
+    for (int y = min_y; y < max_y; y += 1) {
+        uint32_t* pixel = (uint32_t*)(base + (size_t)y * (size_t)b->pitch);
+        for (int x = min_x; x < max_x; x += 1) {
+            pixel[x] = color_bgra;
+        }
+    }
+}
+
+static void draw_cell_filled(const BoardLayout* l, int cell_x, int cell_y, uint32_t color_bgra) {
+    int x0, y0, x1, y1;
+    cell_to_pixel_rect(l, cell_x, cell_y, &x0, &y0, &x1, &y1);
+
+    int pad = 2;
+    draw_rect(&g_backbuffer, x0 + pad, y0 + pad, x1 - pad, y1 - pad, color_bgra);
+}
+
+static bool ivec2_equal(IVec2 a, IVec2 b) {
+    return (a.x == b.x) && (a.y == b.y);
+}
+
+static bool cell_inside_grid(int x, int y) {
+    if (x < 0) return false;
+    if (y < 0) return false;
+    if (x >= GRID_W) return false;
+    if (y >= GRID_H) return false;
+    return true;
+}
+
+// ------------------------------------------------------------
+// Input
+// ------------------------------------------------------------
+
+static InputState input_read(void) {
+    InputState in = { 0 };
+
+    in.up_pressed = (GetAsyncKeyState(VK_UP) & 0x8000) != 0;
+    in.down_pressed = (GetAsyncKeyState(VK_DOWN) & 0x8000) != 0;
+    in.left_pressed = (GetAsyncKeyState(VK_LEFT) & 0x8000) != 0;
+    in.right_pressed = (GetAsyncKeyState(VK_RIGHT) & 0x8000) != 0;
+
+    in.restart_pressed = (GetAsyncKeyState('R') & 0x8000) != 0;
+
+    return in;
+}
+
+static bool key_just_pressed(bool is_down_now, bool* was_down_before) {
+    bool result = false;
+
+    if (is_down_now && !(*was_down_before)) {
+        result = true;
+    }
+
+    *was_down_before = is_down_now;
+    return result;
+}
+
+static void game_apply_direction(SnakeGame* g, const InputState* in) {
+    int new_dx = g->dir_x;
+    int new_dy = g->dir_y;
+
+    if (in->up_pressed) { new_dx = 0;  new_dy = -1; }
+    if (in->down_pressed) { new_dx = 0;  new_dy = 1; }
+    if (in->left_pressed) { new_dx = -1; new_dy = 0; }
+    if (in->right_pressed) { new_dx = 1; new_dy = 0; }
+
+    // No immediate reverse
+    if (new_dx == -g->dir_x && new_dy == -g->dir_y) {
+        return;
+    }
+
+    g->dir_x = new_dx;
+    g->dir_y = new_dy;
+}
+
+// ------------------------------------------------------------
+// RNG + Food placement
+// ------------------------------------------------------------
+
+static uint32_t xorshift32(uint32_t* state) {
+    uint32_t x = *state;
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^= x << 5;
+    *state = x;
+    return x;
+}
+
+static int rand_range_u32(uint32_t* state, int lo, int hi_exclusive) {
+    uint32_t r = xorshift32(state);
+    int span = hi_exclusive - lo;
+    if (span <= 0) {
+        return lo;
+    }
+    return lo + (int)(r % (uint32_t)span);
+}
+
+static bool snake_occupies_cell(const SnakeGame* g, IVec2 c, int count_to_check) {
+    for (int i = 0; i < count_to_check; i += 1) {
+        if (ivec2_equal(g->segments[i], c)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void game_place_food(SnakeGame* g) {
+    for (int attempt = 0; attempt < 512; attempt += 1) {
+        IVec2 c;
+        c.x = rand_range_u32(&g->rng_state, 0, GRID_W);
+        c.y = rand_range_u32(&g->rng_state, 0, GRID_H);
+
+        if (!snake_occupies_cell(g, c, g->segment_count)) {
+            g->food = c;
+            return;
+        }
+    }
+
+    for (int y = 0; y < GRID_H; y += 1) {
+        for (int x = 0; x < GRID_W; x += 1) {
+            IVec2 c = { x, y };
+            if (!snake_occupies_cell(g, c, g->segment_count)) {
+                g->food = c;
+                return;
+            }
+        }
+    }
+
+    g->food = (IVec2){ 0, 0 };
+}
+
+// ------------------------------------------------------------
+// Game init / update
+// ------------------------------------------------------------
+
+static void game_reset(SnakeGame* g, MemoryArena* permanent) {
+    if (!g->segments) {
+        g->segment_capacity = GRID_W * GRID_H;
+        g->segments = ARENA_PUSH_ARRAY(permanent, IVec2, g->segment_capacity);
+        if (!g->segments) {
+            g->segment_capacity = 0;
+            return;
+        }
+    }
+
+    int start_x = GRID_W / 2;
+    int start_y = GRID_H / 2;
+
+    g->segment_count = 4;
+    g->segments[0] = (IVec2){ start_x,     start_y };
+    g->segments[1] = (IVec2){ start_x - 1, start_y };
+    g->segments[2] = (IVec2){ start_x - 2, start_y };
+    g->segments[3] = (IVec2){ start_x - 3, start_y };
+
+    g->dir_x = 1;
+    g->dir_y = 0;
+
+    g->alive = true;
+    g->grow_next_step = false;
+
+    g->move_timer = 0.0f;
+    g->move_period = 0.12f;
+
+    g->rng_state = 0xA341316Cu;
+    if (g->rng_state == 0) {
+        g->rng_state = 1;
+    }
+
+    game_place_food(g);
+}
+
+static void game_step(SnakeGame* g) {
+    if (!g->alive) {
+        return;
+    }
+    if (g->segment_count <= 0) {
+        return;
+    }
+
+    IVec2 old_head = g->segments[0];
+    IVec2 new_head = (IVec2){ old_head.x + g->dir_x, old_head.y + g->dir_y };
+
+    // Wall collision
+    if (!cell_inside_grid(new_head.x, new_head.y)) {
+        g->alive = false;
+        return;
+    }
+
+    // Tail exception if not growing
+    int check_count = g->segment_count;
+    if (!g->grow_next_step && g->segment_count > 0) {
+        check_count = g->segment_count - 1;
+    }
+
+    if (snake_occupies_cell(g, new_head, check_count)) {
+        g->alive = false;
+        return;
+    }
+
+    // Grow first (creates an extra slot to shift into)
+    if (g->grow_next_step) {
+        if (g->segment_count < SNAKE_MAX_SEGMENTS) {
+            g->segments[g->segment_count] = g->segments[g->segment_count - 1];
+            g->segment_count += 1;
+        }
+        g->grow_next_step = false;
+    }
+
+    // Shift body
+    for (int i = g->segment_count - 1; i >= 1; i -= 1) {
+        g->segments[i] = g->segments[i - 1];
+    }
+    g->segments[0] = new_head;
+
+    // Eat food
+    if (ivec2_equal(new_head, g->food)) {
+        g->grow_next_step = true;
+
+        if (g->move_period > 0.06f) {
+            g->move_period -= 0.0025f;
+        }
+
+        game_place_food(g);
+    }
+}
+
+// ------------------------------------------------------------
+// Frame
+// ------------------------------------------------------------
+
+static void do_frame_work(HWND hwnd, float dt_seconds) {
+    // Per-frame arena reset (fast transient allocations)
+    arena_reset(g_app.frame);
+
+    // Where the scratch snippet goes (right after reset):
+    {
+        char* scratch = ARENA_PUSH_ARRAY(g_app.frame, char, 256);
+        if (scratch) {
+            scratch[0] = 0;
+        }
+    }
+
+    InputState in = input_read();
+    game_apply_direction(&g_game, &in);
+
+    // Restart (edge)
+    bool r_down = in.restart_pressed;
+    bool restart_now = key_just_pressed(r_down, &g_prev_r_down);
+    if (restart_now) {
+        game_reset(&g_game, g_app.permanent);
+    }
+
+    // Fixed timestep snake motion
+    if (g_game.alive) {
+        g_game.move_timer += dt_seconds;
+
+        while (g_game.move_timer >= g_game.move_period) {
+            g_game.move_timer -= g_game.move_period;
+            game_step(&g_game);
+
+            if (!g_game.alive) {
+                break;
+            }
+        }
+    }
+
+    // Resize backbuffer to match client exactly
+    RECT rc;
+    GetClientRect(hwnd, &rc);
+    int client_w = rc.right - rc.left;
+    int client_h = rc.bottom - rc.top;
+
+    backbuffer_resize(&g_backbuffer, client_w, client_h);
+
+    // Clear background
+    backbuffer_clear(&g_backbuffer, 0xFF202040);
+
+    // Board layout
+    board_layout_compute(&g_layout, client_w, client_h);
+
+    int board_x0 = g_layout.origin_x;
+    int board_y0 = g_layout.origin_y;
+    int board_x1 = g_layout.origin_x + g_layout.board_px_w;
+    int board_y1 = g_layout.origin_y + g_layout.board_px_h;
+
+    // Board background
+    draw_rect(&g_backbuffer, board_x0, board_y0, board_x1, board_y1, 0xFF101018);
+
+    // Border
+    {
+        int border = 3;
+
+        draw_rect(&g_backbuffer, board_x0 - border, board_y0 - border,
+                  board_x1 + border, board_y0, 0xFFFFFFFF);
+
+        draw_rect(&g_backbuffer, board_x0 - border, board_y1,
+                  board_x1 + border, board_y1 + border, 0xFFFFFFFF);
+
+        draw_rect(&g_backbuffer, board_x0 - border, board_y0,
+                  board_x0, board_y1, 0xFFFFFFFF);
+
+        draw_rect(&g_backbuffer, board_x1, board_y0,
+                  board_x1 + border, board_y1, 0xFFFFFFFF);
+    }
+
+    // Food
+    draw_cell_filled(&g_layout, g_game.food.x, g_game.food.y, 0xFFFFA000);
+
+    // Snake
+    for (int i = 0; i < g_game.segment_count; i += 1) {
+        IVec2 s = g_game.segments[i];
+
+        if (cell_inside_grid(s.x, s.y)) {
+            uint32_t color = 0xFF00CC00;
+            if (i == 0) {
+                color = 0xFF00FF00;
+            }
+            if (!g_game.alive) {
+                color = 0xFF606060;
+            }
+            draw_cell_filled(&g_layout, s.x, s.y, color);
+        }
+    }
+
+    // Game over overlay
+    if (!g_game.alive) {
+        draw_rect(&g_backbuffer, 0, 0, g_backbuffer.width, g_backbuffer.height, 0xAA000000);
+
+        int cx = g_backbuffer.width / 2;
+        int cy = g_backbuffer.height / 2;
+        draw_rect(&g_backbuffer, cx - 200, cy - 60, cx + 200, cy + 60, 0xFFFFFFFF);
+        draw_rect(&g_backbuffer, cx - 196, cy - 56, cx + 196, cy + 56, 0xFF202040);
+    }
+
+    // Present
+    HDC dc = GetDC(hwnd);
+    backbuffer_present(dc, &g_backbuffer, client_w, client_h);
+    ReleaseDC(hwnd, dc);
+
+    // Title stats (optional)
+    static float title_timer = 0.0f;
+    title_timer += dt_seconds;
+
+    if (title_timer >= 0.25f) {
+        title_timer = 0.0f;
+
+        float fps = 0.0f;
+        if (dt_seconds > 0.0f) {
+            fps = 1.0f / dt_seconds;
+        }
+
+        char buffer[256];
+        size_t perm_rem = arena_remaining_bytes(g_app.permanent);
+        size_t frame_rem = arena_remaining_bytes(g_app.frame);
+
+        snprintf(buffer, sizeof(buffer),
+                 "Snake dt %.4f fps %.1f | perm_rem %zu | frame_rem %zu",
+                 dt_seconds, fps, perm_rem, frame_rem);
+
+        SetWindowTextA(hwnd, buffer);
+    }
+}
+
+// ------------------------------------------------------------
+// WinMain
+// ------------------------------------------------------------
+
+int WINAPI WinMain(HINSTANCE instance, HINSTANCE prev_instance, LPSTR cmd_line, int show_code) {
+    (void)prev_instance;
+    (void)cmd_line;
+    (void)show_code;
+
+    // Create arenas FIRST (so g_app.permanent is valid before game_reset)
+    g_app.permanent = arena_create(64u * 1024u * 1024u);
+    g_app.frame = arena_create(4u * 1024u * 1024u);
+
+    if (!g_app.permanent || !g_app.frame) {
+        MessageBoxA(0, "Arena allocation failed", "Error", MB_OK);
+        return 0;
+    }
+
+    // Window class
+    WNDCLASSA wc = { 0 };
+    wc.style = CS_OWNDC | CS_HREDRAW | CS_VREDRAW;
+    wc.lpfnWndProc = wnd_proc;
+    wc.hInstance = instance;
+    wc.lpszClassName = "MySnakeGameWin32MemAlloc";
+
+    if (!RegisterClassA(&wc)) {
+        MessageBoxA(0, "RegisterClassA failed", "Error", MB_OK);
+        arena_destroy(g_app.frame);
+        arena_destroy(g_app.permanent);
+        return 0;
+    }
+
+    HWND hwnd = CreateWindowExA(
+        0,
+        wc.lpszClassName,
+        "My Snake Game Win32 Mem Alloc",
+        WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+        CW_USEDEFAULT, CW_USEDEFAULT,
+        900, 700,
+        0, 0, instance, 0
+    );
+
+    if (!hwnd) {
+        MessageBoxA(0, "CreateWindowExA failed", "Error", MB_OK);
+        arena_destroy(g_app.frame);
+        arena_destroy(g_app.permanent);
+        return 0;
+    }
+
+    // Initial backbuffer size
+    {
+        RECT rc;
+        GetClientRect(hwnd, &rc);
+        int client_w = rc.right - rc.left;
+        int client_h = rc.bottom - rc.top;
+        backbuffer_resize(&g_backbuffer, client_w, client_h);
+    }
+
+    // Init game AFTER permanent arena exists
+    game_reset(&g_game, g_app.permanent);
+
+    Win32Timer timer;
+    timer_init(&timer);
+
+    g_running = true;
+    while (g_running) {
+        if (!pump_messages()) {
+            g_running = false;
+            break;
+        }
+
+        float dt_seconds = timer_tick_seconds(&timer);
+
+        do_frame_work(hwnd, dt_seconds);
+
+        Sleep(1);
+    }
+
+    backbuffer_free(&g_backbuffer);
+
+    arena_destroy(g_app.frame);
+    arena_destroy(g_app.permanent);
+
+    return 0;
+}
